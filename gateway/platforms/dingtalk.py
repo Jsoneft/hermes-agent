@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
-_DINGTALK_WEBHOOK_RE = re.compile(r'^https://api\.dingtalk\.com/')
+_DINGTALK_WEBHOOK_RE = re.compile(r'^https://[a-zA-Z0-9\-]+\.dingtalk\.com/')
 
 
 def check_dingtalk_requirements() -> bool:
@@ -113,9 +113,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             credential = dingtalk_stream.Credential(self._client_id, self._client_secret)
             self._stream_client = dingtalk_stream.DingTalkStreamClient(credential)
 
-            # Capture the current event loop for cross-thread dispatch
-            loop = asyncio.get_running_loop()
-            handler = _IncomingHandler(self, loop)
+            handler = _IncomingHandler(self)
             self._stream_client.register_callback_handler(
                 dingtalk_stream.ChatbotMessage.TOPIC, handler
             )
@@ -129,12 +127,12 @@ class DingTalkAdapter(BasePlatformAdapter):
             return False
 
     async def _run_stream(self) -> None:
-        """Run the blocking stream client with auto-reconnection."""
+        """Run the async stream client with auto-reconnection."""
         backoff_idx = 0
         while self._running:
             try:
                 logger.debug("[%s] Starting stream client...", self.name)
-                await asyncio.to_thread(self._stream_client.start)
+                await self._stream_client.start()
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -235,6 +233,18 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         logger.debug("[%s] Message from %s in %s: %s",
                       self.name, sender_nick, chat_id[:20] if chat_id else "?", text[:50])
+
+        # Send immediate "thinking" indicator before handing off to the agent
+        if session_webhook and self._http_client:
+            try:
+                await self._http_client.post(
+                    session_webhook,
+                    json={"msgtype": "text", "text": {"content": "⏳ 思考中..."}},
+                    timeout=5.0,
+                )
+            except Exception:
+                pass
+
         await self.handle_message(event)
 
     @staticmethod
@@ -307,28 +317,23 @@ class DingTalkAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
-    """dingtalk-stream ChatbotHandler that forwards messages to the adapter."""
+    """dingtalk-stream ChatbotHandler that forwards messages to the adapter.
 
-    def __init__(self, adapter: DingTalkAdapter, loop: asyncio.AbstractEventLoop):
+    The SDK dispatches messages asynchronously via raw_process -> process.
+    process() receives a CallbackMessage; the actual chatbot fields live in
+    callback_message.data and must be parsed into a ChatbotMessage first.
+    """
+
+    def __init__(self, adapter: DingTalkAdapter):
         if DINGTALK_STREAM_AVAILABLE:
             super().__init__()
         self._adapter = adapter
-        self._loop = loop
 
-    def process(self, message: "ChatbotMessage"):
-        """Called by dingtalk-stream in its thread when a message arrives.
-
-        Schedules the async handler on the main event loop.
-        """
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            logger.error("[DingTalk] Event loop unavailable, cannot dispatch message")
-            return dingtalk_stream.AckMessage.STATUS_OK, "OK"
-
-        future = asyncio.run_coroutine_threadsafe(self._adapter._on_message(message), loop)
+    async def process(self, callback_message: "dingtalk_stream.CallbackMessage"):
+        """Called by dingtalk-stream when a chatbot message arrives."""
         try:
-            future.result(timeout=60)
+            chatbot_msg = dingtalk_stream.ChatbotMessage.from_dict(callback_message.data)
+            await self._adapter._on_message(chatbot_msg)
         except Exception:
             logger.exception("[DingTalk] Error processing incoming message")
-
         return dingtalk_stream.AckMessage.STATUS_OK, "OK"
